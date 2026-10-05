@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 100" role="img">
+  <title>HDB Financial Services</title>
+  <path d="M28 22h42v18H48v20h22v18H28z" fill="#174a82"/>
+  <path d="M28 22h20v20H28z" fill="#d64a42"/>
+  <text x="88" y="62" fill="#174a82" font-family="Arial,Helvetica,sans-serif" font-size="42" font-weight="700" letter-spacing="1">HDB</text>
+  <text x="89" y="82" fill="#4c5c70" font-family="Arial,Helvetica,sans-serif" font-size="13" font-weight="700" letter-spacing="2">FINANCIAL SERVICES</text>
+</svg>

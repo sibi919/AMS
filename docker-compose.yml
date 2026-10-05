@@ -1,0 +1,312 @@
+# JOAB Academy — complete local stack, Docker only.
+#
+# Nothing has to be installed on the host except Docker itself: no Node, no npm,
+# no PostgreSQL client, no nginx, no Supabase CLI.
+#
+# Everything is served from ONE origin (http://localhost:${APP_PORT}) through the
+# gateway, so the browser makes same-origin requests and no TLS certificate,
+# hosts-file entry or CORS configuration is needed for local use.
+#
+#   /                 -> frontend (Vite dev server, or built files with --profile prod)
+#   /auth/v1/...      -> Supabase Auth (GoTrue)
+#   /rest/v1/...      -> PostgREST
+#   /storage/v1/...   -> Supabase Storage
+#   /functions/v1/... -> Edge Functions (create-account)
+#
+# Secrets come from .env, which docker/scripts/init-env.sh generates with random
+# values. No password, key or token is written into this file.
+
+name: joab-academy
+
+services:
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/tests.Dockerfile
+    volumes:
+      - ./:/app
+      - joab_node_modules:/app/node_modules
+    environment:
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+    shm_size: 1gb
+
+  db:
+    container_name: joab-db
+    image: supabase/postgres:17.6.1.136
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: 5432
+      POSTGRES_PORT: 5432
+      PGPASSWORD: ${POSTGRES_PASSWORD:?run docker/scripts/init-env.sh first}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+      POSTGRES_DB: postgres
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+    volumes:
+      # Init scripts run only on an empty data directory.
+      - ./docker/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ./docker/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./docker/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      # Named volumes: your data lives here and survives `docker compose down`.
+      - joab_db_data:/var/lib/postgresql/data
+      - joab_db_config:/etc/postgresql-custom
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command:
+      ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+
+  auth:
+    container_name: joab-auth
+    image: supabase/gotrue:v2.196.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${PUBLIC_URL:?run docker/scripts/init-env.sh first}/auth/v1
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_SITE_URL: ${PUBLIC_URL}
+      GOTRUE_URI_ALLOW_LIST: ${PUBLIC_URL}/reset-password,${PUBLIC_URL}/**
+      # Matches supabase/config.toml: no public signup, 12-character minimum.
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_PASSWORD_MIN_LENGTH: "12"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_ISSUER: ${PUBLIC_URL}/auth/v1
+      # Local mail catcher; nothing leaves the machine.
+      GOTRUE_SMTP_HOST: mail
+      GOTRUE_SMTP_PORT: 1025
+      GOTRUE_SMTP_USER: local
+      GOTRUE_SMTP_PASS: local
+      GOTRUE_SMTP_ADMIN_EMAIL: no-reply@joab.local
+      GOTRUE_SMTP_SENDER_NAME: JOAB Academy
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_INVITE: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rest:
+    container_name: joab-rest
+    image: postgrest/postgrest:v14.17
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+      PGRST_ADMIN_SERVER_PORT: 3001
+      PGRST_ADMIN_SERVER_HOST: localhost
+    healthcheck:
+      test: ["CMD", "postgrest", "--ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command: ["postgrest"]
+
+  storage:
+    container_name: joab-storage
+    image: supabase/storage-api:v1.74.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      POSTGREST_URL: http://rest:3000
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      STORAGE_PUBLIC_URL: ${PUBLIC_URL}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      GLOBAL_S3_BUCKET: stub
+      REGION: stub
+      TENANT_ID: joab
+      # Only signed URLs are used by this project, so no image transformation
+      # service is needed and imgproxy is left out.
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+    volumes:
+      # Uploaded profile photos live here and survive `docker compose down`.
+      - joab_storage_data:/var/lib/storage
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  functions:
+    container_name: joab-functions
+    image: supabase/edge-runtime:v1.76.2
+    restart: unless-stopped
+    depends_on:
+      auth:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_URL: http://gateway:8000
+      SUPABASE_PUBLIC_URL: ${PUBLIC_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      # create-account verifies the caller's bearer token itself, exactly as
+      # supabase/config.toml documents (verify_jwt = false).
+      VERIFY_JWT: "false"
+      PORTAL_ORIGIN: ${PUBLIC_URL}
+    volumes:
+      # The project's own functions, read-only, unchanged.
+      - ./supabase/functions:/home/deno/functions:ro
+      # Dispatcher + import map required by the edge runtime.
+      - ./docker/edge-runtime/main:/home/deno/functions/main:ro
+      - ./docker/edge-runtime/deno.jsonc:/home/deno/functions/deno.jsonc:ro
+      - joab_deno_cache:/root/.cache/deno
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/9000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    command: ["start", "--main-service", "/home/deno/functions/main"]
+
+  # Applies supabase/migrations/*.sql once, in filename order, and records what
+  # has been applied. It never drops or resets anything.
+  migrate:
+    container_name: joab-migrate
+    image: postgres:17-alpine
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./supabase/migrations:/migrations:ro
+      - ./docker/migrate/apply-migrations.sh:/apply-migrations.sh:ro
+    entrypoint: ["sh", "/apply-migrations.sh"]
+
+  mail:
+    container_name: joab-mail
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      # Password-recovery emails are readable here. Loopback only.
+      - "127.0.0.1:${MAIL_UI_PORT:-8025}:8025"
+
+  frontend:
+    container_name: joab-frontend
+    build:
+      context: .
+      dockerfile: docker/frontend.dev.Dockerfile
+    image: joab-academy-frontend-dev
+    restart: unless-stopped
+    environment:
+      # Browser-safe values only. No secret is passed to this container.
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:?run docker/scripts/init-env.sh first}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY:?run docker/scripts/init-env.sh first}
+    volumes:
+      # Live source. node_modules stays in the image/volume: the host never
+      # needs Node or an npm install.
+      - ./:/app
+      - joab_node_modules:/app/node_modules
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/5173'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Optional: the built site instead of the dev server.
+  # Start with: docker compose --profile prod up -d --build frontend-prod
+  # and set FRONTEND_UPSTREAM=frontend-prod:8080 in .env, then restart the gateway.
+  frontend-prod:
+    profiles: ["prod"]
+    container_name: joab-frontend-prod
+    build:
+      context: .
+      dockerfile: docker/frontend.prod.Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY:-}
+    image: joab-academy-frontend-prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    container_name: joab-gateway
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      auth:
+        condition: service_healthy
+      rest:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+      functions:
+        condition: service_started
+      frontend:
+        condition: service_started
+    environment:
+      # Rendered into the nginx config by the image's own entrypoint.
+      ANON_KEY: ${ANON_KEY}
+      SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY}
+      FRONTEND_UPSTREAM: ${FRONTEND_UPSTREAM:-frontend:5173}
+    volumes:
+      - ./docker/gateway/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      # The single address you open in the browser. Loopback only.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  joab_db_data:
+  joab_db_config:
+  joab_storage_data:
+  joab_deno_cache:
+  joab_node_modules:

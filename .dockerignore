@@ -1,0 +1,19 @@
+node_modules
+dist
+dist-ssr
+
+# Never copy environment files or backups into an image.
+.env
+.env.*
+!.env.example
+backups
+
+.git
+.gitignore
+playwright-report
+test-results
+*.tsbuildinfo
+*.log
+.DS_Store
+.vscode
+.idea
